@@ -1,40 +1,40 @@
 """Base API."""
 
+import io
 import shutil
 import tempfile
 import typing as tp
+from datetime import datetime
 from pathlib import Path
 
-import torch
-from fastapi import FastAPI, File, Request, UploadFile, status
+import httpx
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import RedirectResponse
 from PIL import Image
-from pydantic import BaseModel
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from prometheus_client import generate_latest
+from starlette.responses import Response
 
-from app.exceptions import (
-    BaseAPIException,
+from app.config import MINIO_BUCKET
+from app.exceptions import BaseAPIException
+from app.metrics import update_metrics
+from app.models import (
+    HealthCheckResponse,
+    IngestRequest,
+    IngestResponse,
+    PredictOutput,
 )
+from app.services.database import save_metadata_to_mongo
+from app.services.prediction import perform_prediction
+from app.services.storage import upload_image_to_minio
 
-
-class PredictOutput(BaseModel):
-    """Model output."""
-
-    predicted_text: str
-    score: float
-    
-class HealthCheckResponse(BaseModel):  # pylint: disable=too-few-public-methods
-    """Schema for health-check response."""
-
-    status: str = "ok"
-
-PROCESSOR = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
-MODEL = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
-# Configure beam search for confidence scoring
-MODEL.config.num_beams = 4
-MODEL.config.early_stopping = True
-MODEL.config.length_penalty = 2.0
-MODEL.config.no_repeat_ngram_size = 3
 
 async def root(req: Request) -> RedirectResponse:
     """Simple redirection to '/docs' taking root_path into account.
@@ -128,27 +128,111 @@ EXTRA_RESPONSES = {
 
 @app.post("/predict", response_model=PredictOutput)
 async def predict(file: UploadFile = File(...)) -> tp.Any:
-    """Predict endpoint."""
+    """Predict endpoint for uploaded files.
+    
+    Args:
+        file: Image file to process
+        
+    Returns:
+        Prediction output with text and confidence score
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         shutil.copyfileobj(file.file, tmp)
+        tmp.flush()  # Ensure data is written to disk
         image_path = Path(tmp.name)
-        img = Image.open(image_path).convert("RGB")  # Replace with your image path
-
-        pixel_values = PROCESSOR(images=img, return_tensors="pt").pixel_values
-
-        # Generate with scores
-        outputs = MODEL.generate(
-            pixel_values,
-            output_scores=True,
-            return_dict_in_generate=True
-        )
-
-        # Decode prediction
-        predicted_text = PROCESSOR.batch_decode(outputs.sequences, skip_special_tokens=True)[0]
-
-        # Get confidence score (log-probability → probability)
-        log_score = outputs.sequences_scores[0].item()
-        confidence = torch.exp(torch.tensor(log_score)).item()
-        print(predicted_text)
-        print(confidence)
+    
+    try:
+        # Open image after closing the temporary file
+        img = Image.open(image_path).convert("RGB")
+        predicted_text, confidence = perform_prediction(img)
+        
+        # Update metrics
+        update_metrics(confidence)
+        
         return PredictOutput(predicted_text=predicted_text, score=confidence)
+    finally:
+        # Clean up temporary file
+        if image_path.exists():
+            image_path.unlink()
+
+
+@app.post("/ingest", response_model=IngestResponse)
+async def ingest_data(
+    request: IngestRequest,
+    background_tasks: BackgroundTasks
+) -> IngestResponse:
+    """Ingest image from URL, predict, and store in MinIO and MongoDB.
+    
+    Args:
+        request: Ingest request containing image URL and optional annotation
+        background_tasks: FastAPI background tasks for async operations
+        
+    Returns:
+        Ingest response with status and prediction results
+    """
+    try:
+        # Download image from URL
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(str(request.image_url))
+            response.raise_for_status()
+            image_data = response.content
+        
+        # Load image
+        img = Image.open(io.BytesIO(image_data)).convert("RGB")
+        
+        # Perform prediction
+        predicted_text, confidence = perform_prediction(img)
+        
+        # Update metrics
+        update_metrics(confidence)
+        
+        # Generate unique image ID
+        image_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        
+        # Schedule background tasks for storage operations
+        # Upload to MinIO in background
+        background_tasks.add_task(
+            upload_image_to_minio,
+            image_data,
+            image_id
+        )
+        
+        # Save metadata to MongoDB in background
+        minio_path = f"{MINIO_BUCKET}/{image_id}.jpg"
+        background_tasks.add_task(
+            save_metadata_to_mongo,
+            image_id=image_id,
+            image_url=str(request.image_url),
+            minio_path=minio_path,
+            predicted_text=predicted_text,
+            score=confidence,
+            annotation=request.annotation
+        )
+        
+        return IngestResponse(
+            status="success",
+            image_id=image_id,
+            predicted_text=predicted_text,
+            score=confidence
+        )
+    
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to download image from URL: {str(e)}"
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal error during ingestion: {str(e)}"
+        ) from e
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    """Expose Prometheus metrics.
+    
+    Returns:
+        Prometheus metrics in text format
+    """
+    return Response(content=generate_latest(), media_type="text/plain")
